@@ -1,0 +1,382 @@
+import os
+import sqlite3
+from datetime import datetime
+from tkinter import *
+from tkinter import ttk, filedialog, messagebox
+from fpdf import FPDF
+from openpyxl import Workbook
+
+# ---------------- SETTINGS ----------------
+CUSTOM = {
+    "company_name": "My Company",
+    "company_address": "123 Street, City, PK",
+    "company_contact": "Phone: +92XXXXXXXXX | Email: info@company.com",
+    "logo_path": "",  # Optional: leave empty if you don't want a logo
+    "footer_note": "Thank you for your business!",
+    "signature_text": "Authorized Signature",
+    "watermark_text": "INVOICE",
+    "table_header_bg": (70,130,180),
+    "table_header_text": (255,255,255),
+    "currency": "PKR",
+    "date_format": "%d-%m-%Y",
+    "invoice_number_format": "INV-{date}-{id:04d}"
+}
+
+DB_FILE = "invoice_app.db"
+
+# ---------------- DATABASE ----------------
+if os.path.exists(DB_FILE):
+    os.remove(DB_FILE)
+
+conn = sqlite3.connect(DB_FILE)
+c = conn.cursor()
+
+c.execute('''CREATE TABLE IF NOT EXISTS customers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT, email TEXT, phone TEXT)''')
+
+c.execute('''CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT, price REAL)''')
+
+c.execute('''CREATE TABLE IF NOT EXISTS invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_number TEXT,
+    customer_id INTEGER,
+    total REAL,
+    tax REAL,
+    discount REAL,
+    final_total REAL,
+    status TEXT,
+    date TEXT,
+    notes TEXT,
+    file_path TEXT,
+    FOREIGN KEY(customer_id) REFERENCES customers(id))''')
+
+c.execute('''CREATE TABLE IF NOT EXISTS invoice_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_id INTEGER,
+    product_id INTEGER,
+    quantity INTEGER,
+    subtotal REAL,
+    FOREIGN KEY(invoice_id) REFERENCES invoices(id),
+    FOREIGN KEY(product_id) REFERENCES products(id))''')
+conn.commit()
+
+# ---------------- GUI ----------------
+root = Tk()
+root.title("Professional Invoice App")
+root.geometry("1400x900")
+
+tab_control = ttk.Notebook(root)
+tab_invoice = Frame(tab_control)
+tab_history = Frame(tab_control)
+tab_custom = Frame(tab_control)
+tab_control.add(tab_invoice, text="Create Invoice")
+tab_control.add(tab_history, text="Invoice History")
+tab_control.add(tab_custom, text="Customize")
+tab_control.pack(expand=1, fill="both")
+
+# ---------------- FUNCTIONS ----------------
+def refresh_customers():
+    customer_combo['values'] = [row[0] for row in c.execute("SELECT name FROM customers").fetchall()]
+
+def refresh_products():
+    product_combo['values'] = [row[0] for row in c.execute("SELECT name FROM products").fetchall()]
+
+def add_customer():
+    name = customer_name.get().strip()
+    email = customer_email.get().strip()
+    phone = customer_phone.get().strip()
+    if not name:
+        messagebox.showerror("Error","Customer name required")
+        return
+    c.execute("INSERT INTO customers (name,email,phone) VALUES (?,?,?)",(name,email,phone))
+    conn.commit()
+    messagebox.showinfo("Success",f"Customer '{name}' added!")
+    refresh_customers()
+    load_history()
+
+def add_product():
+    name = product_name.get().strip()
+    try:
+        price = float(product_price.get())
+    except:
+        messagebox.showerror("Error","Price must be a number")
+        return
+    if not name:
+        messagebox.showerror("Error","Product name required")
+        return
+    c.execute("INSERT INTO products (name,price) VALUES (?,?)",(name,price))
+    conn.commit()
+    messagebox.showinfo("Success",f"Product '{name}' added!")
+    refresh_products()
+
+def add_item_to_invoice():
+    product = product_combo.get()
+    qty = quantity_entry.get()
+    if not product or not qty:
+        messagebox.showerror("Error","Select product and quantity")
+        return
+    try:
+        qty = int(qty)
+    except:
+        messagebox.showerror("Error","Quantity must be integer")
+        return
+    c.execute("SELECT price,id FROM products WHERE name=?",(product,))
+    row = c.fetchone()
+    if not row:
+        messagebox.showerror("Error","Product not found")
+        return
+    price, product_id = row
+    subtotal = price*qty
+    invoice_items_tree.insert('',END,values=(product,qty,float(price),float(subtotal), product_id))
+    update_total()
+
+def update_total():
+    total = sum(float(invoice_items_tree.item(child)['values'][3]) for child in invoice_items_tree.get_children())
+    total_label.config(text=f"Total: {CUSTOM['currency']}{total:.2f}")
+
+# ---------------- PDF ----------------
+class PDF(FPDF):
+    def header(self):
+        # Optional logo
+        if CUSTOM["logo_path"] and os.path.exists(CUSTOM["logo_path"]):
+            self.image(CUSTOM["logo_path"], 10, 8, 50)
+        # Company Info
+        self.set_font('Arial','B',14)
+        self.cell(0,10,CUSTOM["company_name"], ln=True)
+        self.set_font('Arial','',12)
+        self.cell(0,8,CUSTOM["company_address"], ln=True)
+        self.cell(0,8,CUSTOM["company_contact"], ln=True)
+        self.ln(10)
+
+def generate_pdf(invoice_number, customer_name, items, tax, discount_percent, final_total, status, date, notes, save_path):
+    pdf = PDF()
+    pdf.add_page()
+    pdf.set_font("Arial",'B',16)
+    pdf.cell(0,10,f"INVOICE #{invoice_number}",ln=True,align="C")
+    pdf.set_font("Arial",'',12)
+    pdf.cell(0,8,f"Date: {date}",ln=True)
+    pdf.cell(0,8,f"Customer: {customer_name}",ln=True)
+    pdf.cell(0,8,f"Payment Status: {status}",ln=True)
+    pdf.ln(5)
+    
+    # Table Header
+    pdf.set_fill_color(*CUSTOM["table_header_bg"])
+    pdf.set_text_color(*CUSTOM["table_header_text"])
+    pdf.set_font("Arial",'B',12)
+    pdf.cell(60,10,"Product",border=1,fill=True)
+    pdf.cell(30,10,"Qty",border=1,fill=True)
+    pdf.cell(40,10,"Price",border=1,fill=True)
+    pdf.cell(40,10,"Subtotal",border=1,fill=True)
+    pdf.ln()
+    pdf.set_font("Arial",'',12)
+    pdf.set_text_color(0,0,0)
+    
+    for product_name, qty, price, subtotal, product_id in items:
+        price = float(price)
+        subtotal = float(subtotal)
+        if pdf.get_y() > 260:
+            pdf.add_page()
+        pdf.cell(60,10,product_name,border=1)
+        pdf.cell(30,10,str(qty),border=1)
+        pdf.cell(40,10,f"{CUSTOM['currency']}{price:.2f}",border=1)
+        pdf.cell(40,10,f"{CUSTOM['currency']}{subtotal:.2f}",border=1)
+        pdf.ln()
+    
+    pdf.cell(130,10,"Tax",border=1)
+    pdf.cell(40,10,f"{CUSTOM['currency']}{float(tax):.2f}",border=1)
+    pdf.ln()
+    pdf.cell(130,10,"Discount (%)",border=1)
+    pdf.cell(40,10,f"{discount_percent:.2f}%",border=1)
+    pdf.ln()
+    pdf.set_font("Arial",'B',12)
+    pdf.cell(130,10,"Final Total",border=1)
+    pdf.cell(40,10,f"{CUSTOM['currency']}{float(final_total):.2f}",border=1)
+    pdf.ln(10)
+    
+    if notes:
+        pdf.set_font("Arial",'',10)
+        pdf.multi_cell(0,10,f"Notes: {notes}")
+        pdf.ln(5)
+    
+    pdf.ln(20)
+    pdf.cell(100,10,"__________________________",ln=False)
+    pdf.cell(0,10,"",ln=True)
+    pdf.cell(100,10,CUSTOM["signature_text"],ln=False)
+    pdf.ln(10)
+    pdf.set_font("Arial",'',10)
+    pdf.multi_cell(0,10,CUSTOM["footer_note"])
+    pdf.output(save_path)
+
+# ---------------- CREATE INVOICE GUI ----------------
+Label(tab_invoice,text="Add Customer",font=("Arial",14,'bold')).pack(pady=5)
+customer_name = Entry(tab_invoice); customer_name.pack(); customer_name.insert(0,"Name")
+customer_email = Entry(tab_invoice); customer_email.pack(); customer_email.insert(0,"Email")
+customer_phone = Entry(tab_invoice); customer_phone.pack(); customer_phone.insert(0,"Phone")
+Button(tab_invoice,text="Add Customer",command=add_customer).pack(pady=5)
+customer_combo = ttk.Combobox(tab_invoice); customer_combo.pack(pady=5)
+
+Label(tab_invoice,text="Add Product",font=("Arial",14,'bold')).pack(pady=5)
+product_name = Entry(tab_invoice); product_name.pack(); product_name.insert(0,"Product Name")
+product_price = Entry(tab_invoice); product_price.pack(); product_price.insert(0,"Price")
+Button(tab_invoice,text="Add Product",command=add_product).pack(pady=5)
+product_combo = ttk.Combobox(tab_invoice); product_combo.pack(pady=5)
+quantity_entry = Entry(tab_invoice); quantity_entry.pack(pady=5); quantity_entry.insert(0,"Quantity")
+Button(tab_invoice,text="Add Item to Invoice",command=add_item_to_invoice).pack(pady=5)
+
+columns = ('Product','Quantity','Price','Subtotal','ProductID')
+invoice_items_tree = ttk.Treeview(tab_invoice,columns=columns,show='headings',height=8)
+for col in columns[:-1]: invoice_items_tree.heading(col,text=col)
+invoice_items_tree.pack(pady=10)
+
+total_label = Label(tab_invoice,text=f"Total: {CUSTOM['currency']}0.00",font=("Arial",14))
+total_label.pack(pady=5)
+
+Label(tab_invoice,text="Tax:",font=("Arial",12)).pack()
+tax_entry = Entry(tab_invoice); tax_entry.pack(); tax_entry.insert(0,"0")
+Label(tab_invoice,text="Discount (%):",font=("Arial",12)).pack()
+discount_entry = Entry(tab_invoice); discount_entry.pack(); discount_entry.insert(0,"0")
+Label(tab_invoice,text="Payment Status:",font=("Arial",12)).pack()
+status_var = StringVar(); status_var.set("Unpaid")
+status_menu = ttk.Combobox(tab_invoice,textvariable=status_var,values=["Unpaid","Paid"]); status_menu.pack(pady=5)
+
+Label(tab_invoice,text="Notes:",font=("Arial",12)).pack()
+notes_text = Text(tab_invoice,height=4)
+notes_text.pack(pady=5)
+
+def create_invoice_gui():
+    customer_name_val = customer_combo.get() or "Guest"
+    customer_id_row = c.execute("SELECT id FROM customers WHERE name=?",(customer_name_val,)).fetchone()
+    customer_id = customer_id_row[0] if customer_id_row else None
+    items = [invoice_items_tree.item(child)['values'] for child in invoice_items_tree.get_children()]
+    if not items:
+        messagebox.showerror("Error","Add at least one product")
+        return
+    try:
+        tax = float(tax_entry.get())
+        discount_percent = float(discount_entry.get())
+    except:
+        messagebox.showerror("Error","Tax and Discount must be numbers")
+        return
+    total = sum([float(x[3]) for x in items])
+    discount_amount = total * (discount_percent / 100)
+    final_total = total + tax - discount_amount
+    status = status_var.get()
+    date = datetime.now().strftime(CUSTOM['date_format'])
+    
+    next_id = c.execute("SELECT MAX(id) FROM invoices").fetchone()[0] or 0
+    invoice_number = CUSTOM['invoice_number_format'].format(date=datetime.now().strftime("%Y%m%d"), id=next_id+1)
+    
+    save_path = filedialog.asksaveasfilename(
+        defaultextension=".pdf",
+        initialfile=f"{invoice_number}.pdf",
+        filetypes=[("PDF files","*.pdf")]
+    )
+    if not save_path:
+        messagebox.showwarning("Cancelled","Invoice save cancelled")
+        return
+    
+    directory = os.path.dirname(save_path)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    
+    try:
+        generate_pdf(invoice_number, customer_name_val, items, tax, discount_percent, final_total, status, date, notes_text.get("1.0",END).strip(), save_path)
+    except Exception as e:
+        messagebox.showerror("PDF Error",f"Failed to save PDF:\n{str(e)}")
+        return
+    
+    c.execute("""INSERT INTO invoices (invoice_number,customer_id,total,tax,discount,final_total,status,date,notes,file_path)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                 (invoice_number, customer_id, total, tax, discount_percent, final_total, status, date, notes_text.get("1.0",END).strip(), save_path))
+    invoice_id = c.lastrowid
+    for product_name_val, qty, price, subtotal, product_id in items:
+        c.execute("INSERT INTO invoice_items (invoice_id,product_id,quantity,subtotal) VALUES (?,?,?,?)",
+                  (invoice_id, product_id, qty, subtotal))
+    conn.commit()
+    messagebox.showinfo("Success",f"Invoice {invoice_number} created!\nSaved at:\n{save_path}")
+    invoice_items_tree.delete(*invoice_items_tree.get_children())
+    total_label.config(text=f"Total: {CUSTOM['currency']}0.00")
+    refresh_customers()
+    refresh_products()
+    load_history()
+
+Button(tab_invoice,text="Create Invoice",font=("Arial",12,'bold'),command=create_invoice_gui).pack(pady=10)
+
+# ---------------- HISTORY TAB ----------------
+history_tree = ttk.Treeview(tab_history,columns=("Invoice","Customer","Date","Status","Final Total"),show="headings")
+for col in ("Invoice","Customer","Date","Status","Final Total"):
+    history_tree.heading(col,text=col)
+history_tree.pack(expand=True,fill="both")
+
+def load_history():
+    for row in history_tree.get_children():
+        history_tree.delete(row)
+    rows = c.execute("""SELECT invoices.invoice_number, customers.name, invoices.date, invoices.status, invoices.final_total
+                        FROM invoices LEFT JOIN customers ON invoices.customer_id=customers.id""").fetchall()
+    for r in rows:
+        history_tree.insert('',END,values=r)
+
+def export_history_to_excel():
+    save_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files","*.xlsx")])
+    if not save_path:
+        return
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Invoices"
+    headers = ["Invoice Number","Customer Name","Date","Status","Total","Tax","Discount (%)","Final Total","File Path"]
+    ws.append(headers)
+    rows = c.execute("""SELECT invoices.invoice_number, customers.name, invoices.date, invoices.status,
+                        invoices.total, invoices.tax, invoices.discount, invoices.final_total, invoices.file_path
+                        FROM invoices LEFT JOIN customers ON invoices.customer_id=customers.id""").fetchall()
+    for row in rows:
+        ws.append(row)
+    wb.save(save_path)
+    messagebox.showinfo("Success", f"Invoice history exported to {save_path}")
+
+Button(tab_history,text="Export History to Excel",command=export_history_to_excel).pack(pady=10)
+
+# ---------------- CUSTOMIZE TAB ----------------
+Label(tab_custom,text="Customize Company Info",font=("Arial",14,'bold')).pack(pady=5)
+entry_company = Entry(tab_custom); entry_company.pack(); entry_company.insert(0,CUSTOM["company_name"])
+entry_address = Entry(tab_custom); entry_address.pack(); entry_address.insert(0,CUSTOM["company_address"])
+entry_contact = Entry(tab_custom); entry_contact.pack(); entry_contact.insert(0,CUSTOM["company_contact"])
+entry_footer = Entry(tab_custom); entry_footer.pack(); entry_footer.insert(0,CUSTOM["footer_note"])
+entry_signature = Entry(tab_custom); entry_signature.pack(); entry_signature.insert(0,CUSTOM["signature_text"])
+entry_watermark = Entry(tab_custom); entry_watermark.pack(); entry_watermark.insert(0,CUSTOM["watermark_text"])
+entry_logo = Entry(tab_custom); entry_logo.pack(); entry_logo.insert(0,CUSTOM["logo_path"])
+entry_currency = Entry(tab_custom); entry_currency.pack(); entry_currency.insert(0,CUSTOM["currency"])
+entry_dateformat = Entry(tab_custom); entry_dateformat.pack(); entry_dateformat.insert(0,CUSTOM["date_format"])
+entry_invformat = Entry(tab_custom); entry_invformat.pack(); entry_invformat.insert(0,CUSTOM["invoice_number_format"])
+
+def browse_logo():
+    path = filedialog.askopenfilename(title="Select Logo", filetypes=[("Image files","*.png;*.jpg;*.jpeg;*.bmp")])
+    if path:
+        entry_logo.delete(0, END)
+        entry_logo.insert(0, path)
+
+Button(tab_custom, text="Browse Logo", command=browse_logo).pack(pady=2)
+
+def save_customization():
+    CUSTOM["company_name"] = entry_company.get()
+    CUSTOM["company_address"] = entry_address.get()
+    CUSTOM["company_contact"] = entry_contact.get()
+    CUSTOM["footer_note"] = entry_footer.get()
+    CUSTOM["signature_text"] = entry_signature.get()
+    CUSTOM["watermark_text"] = entry_watermark.get()
+    CUSTOM["logo_path"] = entry_logo.get()
+    CUSTOM["currency"] = entry_currency.get()
+    CUSTOM["date_format"] = entry_dateformat.get()
+    CUSTOM["invoice_number_format"] = entry_invformat.get()
+    messagebox.showinfo("Saved","Customization saved!")
+
+Button(tab_custom,text="Save Customization",command=save_customization).pack(pady=10)
+
+# ---------------- INITIAL LOAD ----------------
+refresh_customers()
+refresh_products()
+load_history()
+
+root.mainloop()
